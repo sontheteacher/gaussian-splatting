@@ -471,3 +471,43 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+
+# Utility function for loading Gaussian models
+def load_gaussian_model(path: str, sh_degree: int = 3):
+    """
+    Load a Gaussian model from a PLY file.
+    
+    Args:
+        path: Path to the .ply file
+        sh_degree: Spherical harmonics degree (default: 3)
+    
+    Returns:
+        tuple: (xyz_numpy, gaussian_model)
+            - xyz_numpy: (N, 3) numpy array of point coordinates
+            - gaussian_model: GaussianModel instance with loaded data
+    
+    Example:
+        >>> from scene.gaussian_model import load_gaussian_model
+        >>> points, model = load_gaussian_model("scene.ply")
+        >>> opacities = model.get_opacity.detach().cpu().numpy()
+    """
+    import os
+    import numpy as np
+    
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"PLY file not found: {path}")
+    
+    try:
+        # Create GaussianModel instance
+        gaussian_model = GaussianModel(sh_degree=sh_degree)
+        
+        # Load the PLY file using GaussianModel's load_ply method
+        gaussian_model.load_ply(path)
+        
+        # Get the XYZ coordinates as numpy array
+        xyz = gaussian_model.get_xyz.detach().cpu().numpy()
+        
+        return xyz.astype(np.float64), gaussian_model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Gaussian model from {path}: {e}")

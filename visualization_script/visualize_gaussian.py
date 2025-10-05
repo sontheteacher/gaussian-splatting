@@ -45,7 +45,7 @@ except Exception as e:  # pragma: no cover
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 try:
-    from scene.gaussian_model import GaussianModel
+    from scene.gaussian_model import GaussianModel, load_gaussian_model
 except Exception as e:  # pragma: no cover
     print("[ERROR] Could not import GaussianModel from scene.gaussian_model.")
     raise
@@ -79,26 +79,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_gaussian_model(path: str, sh_degree: int = 3) -> tuple[np.ndarray, GaussianModel]:
-    """Load Gaussian model and return points + full model for future use"""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-    
-    try:
-        # Create GaussianModel instance
-        gaussian_model = GaussianModel(sh_degree=sh_degree)
-        
-        # Load the PLY file using GaussianModel's load_ply method
-        gaussian_model.load_ply(path)
-        
-        # Get the XYZ coordinates as numpy array
-        xyz = gaussian_model.get_xyz.detach().cpu().numpy()
-        
-        return xyz.astype(np.float64), gaussian_model
-    except Exception as e:
-        raise RuntimeError(f"Failed to load Gaussian model: {e}")
-
-
 def choose_source(points: np.ndarray, idx: int | None) -> int:
     if idx is not None:
         if not (0 <= idx < len(points)):
@@ -125,7 +105,7 @@ def main() -> int:
         print(f"[INFO] Loaded {len(pts)} points using GaussianModel. Bounds min={pts.min(0)}, max={pts.max(0)}")
         
         # Extract Gaussian properties for visualization and storage
-        print("[INFO] Extracting Gaussian properties...")
+        # print("[INFO] Extracting Gaussian properties...")
         # Only extract what we need for point cloud geodesic analysis
         # opacities = gaussian_model.get_opacity.detach().cpu().numpy()
         # scales = gaussian_model.get_scaling.detach().cpu().numpy()
