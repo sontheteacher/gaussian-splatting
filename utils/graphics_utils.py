@@ -75,3 +75,40 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
+
+def rodrigues_numpy(axis, angle):
+    """
+    Rodrigues rotation formula to create rotation matrix from axis and angle.
+    
+    Args:
+        axis: rotation axis as numpy array of shape (N, 3) 
+        angle: rotation angle in radians (scalar)
+    
+    Returns:
+        Rotation matrix of shape (N, 3, 3)
+    """
+    axis = np.array(axis)
+    if axis.ndim == 1:
+        axis = axis.reshape(1, -1)
+    
+    # Normalize axis
+    axis_norm = np.linalg.norm(axis, axis=1, keepdims=True)
+    axis = axis / (axis_norm + 1e-8)
+    
+    cos_angle = np.cos(angle)
+    sin_angle = np.sin(angle)
+    
+    # Cross product matrix for each axis
+    K = np.zeros((axis.shape[0], 3, 3))
+    K[:, 0, 1] = -axis[:, 2]
+    K[:, 0, 2] = axis[:, 1]
+    K[:, 1, 0] = axis[:, 2]
+    K[:, 1, 2] = -axis[:, 0]
+    K[:, 2, 0] = -axis[:, 1]
+    K[:, 2, 1] = axis[:, 0]
+    
+    # Rodrigues formula: R = I + sin(θ)*K + (1-cos(θ))*K^2
+    I = np.eye(3)[np.newaxis, :, :].repeat(axis.shape[0], axis=0)
+    R = I + sin_angle * K + (1 - cos_angle) * np.matmul(K, K)
+    
+    return R.squeeze() if R.shape[0] == 1 else R
