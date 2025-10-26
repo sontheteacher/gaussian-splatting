@@ -165,7 +165,9 @@ def estimate_geodesic_radius(points: np.ndarray, percentile: float = 10.0, use_g
     
     # Use adaptive multiple based on point cloud characteristics
     # For dense clouds: smaller multiple, for sparse: larger multiple
-    density_factor = max(2.0, min(5.0, 3.0 * (avg_knn_dist / percentile_distance)))
+    density_factor = 3.0  # Default value
+    if percentile_distance > 1e-10:  # Avoid division by zero
+        density_factor = max(2.0, min(5.0, 3.0 * (avg_knn_dist / percentile_distance)))
     radius = avg_knn_dist * density_factor
     
     return radius
@@ -698,22 +700,252 @@ def gaussian_normal_estimation(vertices: np.ndarray,
 # k-NN BASED NORMAL ESTIMATION (BVH)
 # ============================================================================
 
+def estimate_normals_svd_knn(vertices: np.ndarray, 
+                            knn_indices: np.ndarray,
+                            knn_distances: np.ndarray,
+                            k_neighbors: int = 15,
+                            y_up: bool = True,
+                            use_gpu: bool = True,
+                            return_confidences: bool = False,
+                            sigma: float = 0.5,
+                            prune_factor: float = 2.0) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
+    """
+    ULTRA-FAST: Direct SVD normal estimation from k-NN indices (no adjacency conversion).
+    
+    This is the most optimized version - operates directly on k-NN results without
+    any intermediate data structure conversions.
+    
+    Args:
+        vertices: Point positions (N, 3)
+        knn_indices: k-NN neighbor indices (N, k) from _torch_knn
+        knn_distances: k-NN distances (N, k) from _torch_knn  
+        k_neighbors: Number of neighbors per point
+        y_up: If True, orient normals to point in +Y direction
+        use_gpu: If True, use GPU acceleration with torch
+        return_confidences: If True, return (normals, confidences) tuple
+        sigma: Gaussian kernel sigma for confidence estimation
+        prune_factor: Distance-based pruning threshold multiplier
+        
+    Returns:
+        If return_confidences=False: Normals array (N, 3)
+        If return_confidences=True: Tuple of (normals, confidences) arrays
+    """
+    import time
+    
+    start_total = time.time()
+    n_points = len(vertices)
+    normals = np.zeros((n_points, 3))
+    confidences = np.zeros(n_points) if return_confidences else None
+    
+    # Determine device
+    device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+    
+    # No adjacency building needed - direct from k-NN!
+    start_adjacency = time.time()
+    time_adjacency = time.time() - start_adjacency  # Will be ~0ms
+    
+    # Convert vertices to torch tensor on device
+    start_gpu_transfer = time.time()
+    vertices_torch = torch.from_numpy(vertices).float().to(device)
+    knn_indices_torch = torch.from_numpy(knn_indices).long().to(device)
+    knn_distances_torch = torch.from_numpy(knn_distances).float().to(device)
+    time_gpu_transfer = time.time() - start_gpu_transfer
+    
+    # Apply distance-based pruning
+    if prune_factor > 0:
+        positive_distances = knn_distances[knn_distances > 0]
+        if len(positive_distances) > 0:
+            avg_radius = np.mean(positive_distances)
+            prune_threshold = avg_radius * prune_factor
+            valid_mask = torch.from_numpy(knn_distances <= prune_threshold).to(device)
+            knn_indices_torch = knn_indices_torch * valid_mask.long()
+            knn_distances_torch = knn_distances_torch * valid_mask.float()
+        # If no positive distances, skip pruning
+    
+    # Ultra-vectorized batch SVD processing
+    start_svd_loop = time.time()
+    time_svd_computation = 0.0
+    time_confidence_computation = 0.0
+    
+    # Process in batches for GPU memory management
+    batch_size = min(1000, n_points)
+    
+    for batch_start in range(0, n_points, batch_size):
+        batch_end = min(batch_start + batch_size, n_points)
+        current_batch_size = batch_end - batch_start
+        
+        # Extract batch data directly from k-NN results
+        batch_knn_indices = knn_indices_torch[batch_start:batch_end]  # (B, k)
+        batch_knn_distances = knn_distances_torch[batch_start:batch_end]  # (B, k)
+        batch_centers = vertices_torch[batch_start:batch_end]  # (B, 3)
+        
+        # Create valid neighbor mask (exclude invalid indices)
+        valid_neighbors = (batch_knn_indices >= 0) & (batch_knn_distances > 0)
+        
+        start_svd = time.time()
+        
+        # Vectorized neighbor position gathering
+        batch_knn_indices_flat = batch_knn_indices.flatten()
+        valid_flat = batch_knn_indices_flat >= 0
+        
+        # Gather all neighbor positions at once
+        neighbor_positions_flat = torch.zeros_like(vertices_torch[batch_knn_indices_flat])
+        if valid_flat.any():
+            neighbor_positions_flat[valid_flat] = vertices_torch[batch_knn_indices_flat[valid_flat]]
+        
+        # Reshape to batch format
+        neighbor_positions = neighbor_positions_flat.view(current_batch_size, k_neighbors, 3)
+        
+        # Center the neighborhoods (subtract vertex position)
+        batch_centers_expanded = batch_centers.unsqueeze(1).expand(-1, k_neighbors, -1)
+        centered_neighborhoods = neighbor_positions - batch_centers_expanded
+        
+        # Apply valid neighbor mask
+        centered_neighborhoods = centered_neighborhoods * valid_neighbors.unsqueeze(-1).float()
+        
+        try:
+            # Batch SVD computation - MASSIVE PARALLELIZATION!
+            U, S, Vh = torch.linalg.svd(centered_neighborhoods, full_matrices=False)
+            
+            # Extract normals (last column of Vh for each batch item)
+            batch_normals = Vh[:, -1, :].cpu().numpy()  # (B, 3)
+            
+            # Apply orientation constraints
+            if y_up:
+                flip_mask = batch_normals[:, 1] < 0
+                batch_normals[flip_mask] = -batch_normals[flip_mask]
+            else:
+                flip_mask = batch_normals[:, 2] < 0
+                batch_normals[flip_mask] = -batch_normals[flip_mask]
+            
+            # Normalize normals
+            norms = np.linalg.norm(batch_normals, axis=1, keepdims=True)
+            batch_normals = batch_normals / (norms + 1e-10)
+            
+            time_svd_computation += time.time() - start_svd
+            
+            # VECTORIZED confidence computation
+            if return_confidences:
+                start_confidence = time.time()
+                
+                # Protect against division by zero
+                if sigma <= 0:
+                    print(f"[WARN] Invalid sigma value: {sigma}, using default weights")
+                    batch_confidence_sums = torch.sum(valid_neighbors.float(), dim=1).cpu().numpy()
+                else:
+                    # All operations on GPU - no loops!
+                    sigma_torch = torch.tensor(sigma, device=device)
+                    batch_weights = torch.exp(-batch_knn_distances**2 / (2 * sigma_torch**2))
+                    batch_weights = batch_weights * valid_neighbors.float()
+                    batch_confidence_sums = torch.sum(batch_weights, dim=1).cpu().numpy()
+                
+                confidences[batch_start:batch_end] = batch_confidence_sums
+                
+                time_confidence_computation += time.time() - start_confidence
+            
+            # Assign computed normals
+            normals[batch_start:batch_end] = batch_normals
+            
+        except Exception as e:
+            print(f"[WARN] Batch SVD failed: {e}, falling back to individual processing")
+            # Fallback to individual processing for this batch - same as adjacency method
+            for i in range(current_batch_size):
+                idx = batch_start + i
+                try:
+                    # Get valid neighbors for this point
+                    point_knn_indices = knn_indices[idx]
+                    point_knn_distances = knn_distances[idx]
+                    valid_mask = (point_knn_indices >= 0) & (point_knn_distances > 0)
+                    
+                    if not valid_mask.any():
+                        # No valid neighbors
+                        normals[idx] = np.array([0.0, 0.0, 0.0])
+                        if return_confidences:
+                            confidences[idx] = 0.0
+                        continue
+                    
+                    # Get valid neighbor positions
+                    valid_indices = point_knn_indices[valid_mask]
+                    valid_distances = point_knn_distances[valid_mask]
+                    
+                    # Center the neighborhood
+                    neighbors_torch = vertices_torch[valid_indices] - vertices_torch[idx]
+                    
+                    # Individual SVD
+                    U, S, Vh = torch.linalg.svd(neighbors_torch, full_matrices=False)
+                    normal = Vh[-1, :].cpu().numpy()
+                    
+                    # Apply orientation constraints
+                    if y_up and normal[1] < 0:
+                        normal = -normal
+                    elif not y_up and normal[2] < 0:
+                        normal = -normal
+                    
+                    # Normalize
+                    normals[idx] = normal / (np.linalg.norm(normal) + 1e-10)
+                    
+                    # Individual confidence computation
+                    if return_confidences:
+                        if sigma <= 0:
+                            confidences[idx] = len(valid_indices)  # Just count neighbors
+                        else:
+                            weights = np.exp(-valid_distances**2 / (2 * sigma**2))
+                            confidences[idx] = np.sum(weights)
+                    
+                except Exception as inner_e:
+                    print(f"[WARN] Individual SVD failed for point {idx}: {inner_e}")
+                    normals[idx] = np.array([0.0, 0.0, 0.0])
+                    if return_confidences:
+                        confidences[idx] = 0.0
+    
+    time_svd_loop = time.time() - start_svd_loop
+    time_total = time.time() - start_total
+    
+    # Print timing breakdown
+    print(f"\n⚡ ULTRA-FAST NORMAL ESTIMATION TIMING:")
+    if time_total > 1e-10:
+        # print(f"  Adjacency list build:    {time_adjacency*1000:>8.2f}ms ({time_adjacency/time_total*100:>5.1f}%)")
+        print(f"  GPU tensor transfer:     {time_gpu_transfer*1000:>8.2f}ms ({time_gpu_transfer/time_total*100:>5.1f}%)")
+        print(f"  SVD computation:         {time_svd_computation*1000:>8.2f}ms ({time_svd_computation/time_total*100:>5.1f}%)")
+        if return_confidences and time_confidence_computation > 0:
+            print(f"  Confidence computation:  {time_confidence_computation*1000:>8.2f}ms ({time_confidence_computation/time_total*100:>5.1f}%)")
+        other_time = max(0, time_total - time_gpu_transfer - time_svd_computation - time_confidence_computation)
+        print(f"  Other operations:        {other_time*1000:>8.2f}ms ({other_time/time_total*100:>5.1f}%)")
+        print(f"  {'-'*50}")
+        print(f"  Total:                   {time_total*1000:>8.2f}ms (100.0%)")
+    else:
+        print(f"  Total time too small for breakdown: {time_total*1000:.4f}ms")
+    
+    # Normalize confidences to [0, 1] range if requested
+    if return_confidences and confidences is not None:
+        if confidences.max() > confidences.min():
+            confidences = (confidences - confidences.min()) / (confidences.max() - confidences.min())
+            print(f"[INFO] Normalized confidences to [0, 1] range")
+        else:
+            print(f"[INFO] All confidences equal ({confidences[0]:.6f}), no normalization needed")
+    
+    if return_confidences:
+        return normals, confidences
+    else:
+        return normals
+
+
 def estimate_normals_svd_simple(vertices: np.ndarray, 
-                               edges: np.ndarray, 
+                               adjacency_lists: list[list[int]], 
                                k_neighbors: int = 15,
                                y_up: bool = True,
                                use_gpu: bool = True,
                                return_confidences: bool = False,
-                               sigma: float = 0.1) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
+                               sigma: float = 0.5) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
     """
-    Estimate normals using SVD on neighborhoods defined by existing connectivity edges.
-    Uses the adjacency information from edges instead of rebuilding k-NN queries.
+    Estimate normals using SVD on neighborhoods defined by adjacency lists.
+    Direct adjacency input eliminates redundant edge-to-adjacency reconstruction.
     
-    Optimized with torch.svd on GPU for significant speedup.
+    Optimized with vectorized batch SVD on GPU for massive speedup.
     
     Args:
         vertices: Point positions (N, 3)
-        edges: Edge connectivity (M, 2)
+        adjacency_lists: Pre-computed neighbor lists, adjacency_lists[i] = neighbors of vertex i
         k_neighbors: Expected number of neighbors (unused, kept for API compatibility)
         y_up: If True, orient normals to point in +Y direction (default: True)
         use_gpu: If True, use GPU acceleration with torch (default: True)
@@ -730,18 +962,14 @@ def estimate_normals_svd_simple(vertices: np.ndarray,
     n_points = len(vertices)
     normals = np.zeros((n_points, 3))
     confidences = np.zeros(n_points) if return_confidences else None
-    default_normal = np.array([0, 1, 0] if y_up else [0, 0, 1])
+    # Remove the default_normal initialization - let both methods use [0,0,0] for consistency
     
     # Determine device
     device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
     
-    # Build adjacency list from edges for efficient neighbor lookup
+    # Use pre-computed adjacency lists directly (no reconstruction needed!)
     start_adjacency = time.time()
-    adjacency = [[] for _ in range(n_points)]
-    for edge in edges:
-        i, j = edge[0], edge[1]
-        adjacency[i].append(j)
-        adjacency[j].append(i)
+    adjacency = adjacency_lists  # Direct assignment - massive time saving!
     time_adjacency = time.time() - start_adjacency
     
     # Convert vertices to torch tensor on device
@@ -773,8 +1001,9 @@ def estimate_normals_svd_simple(vertices: np.ndarray,
         for i in range(batch_start, batch_end):
             neighbor_indices = adjacency[i]
             
-            if len(neighbor_indices) < 3:
-                # Mark as invalid - use dummy data with correct size
+            # Remove the < 3 filter - use all available neighbors like k-NN method
+            if len(neighbor_indices) == 0:
+                # Only skip if NO neighbors at all
                 batch_valid_mask.append(False)
                 batch_neighborhoods.append(torch.zeros((max_neighbors, 3), device=device))  # Dummy data with correct size
                 batch_neighbor_counts.append(0)
@@ -833,25 +1062,52 @@ def estimate_normals_svd_simple(vertices: np.ndarray,
             
             time_svd_computation += time.time() - start_svd
             
-            # Batch confidence computation if requested
+            # Vectorized batch confidence computation (GPU accelerated!)
             if return_confidences:
                 start_confidence = time.time()
                 
-                for i, (is_valid, neighbor_indices) in enumerate(zip(batch_valid_mask, batch_indices)):
-                    idx = batch_start + i
+                # Prepare batch confidence computation on GPU
+                batch_confidences = np.zeros(current_batch_size)
+                
+                # Create padded tensor for all neighborhoods in batch: (B, max_neighbors)
+                max_batch_neighbors = max(len(indices) for indices in batch_indices) if batch_indices else 0
+                
+                if max_batch_neighbors > 0:
+                    # Build batch tensor for vectorized distance computation
+                    batch_positions = torch.zeros((current_batch_size, max_batch_neighbors, 3), device=device)
+                    batch_centers = torch.zeros((current_batch_size, 3), device=device)
+                    batch_masks = torch.zeros((current_batch_size, max_batch_neighbors), device=device, dtype=torch.bool)
                     
-                    if not is_valid or len(neighbor_indices) == 0:
-                        confidences[idx] = 0.0
-                        continue
+                    for i, (is_valid, neighbor_indices) in enumerate(zip(batch_valid_mask, batch_indices)):
+                        if is_valid and len(neighbor_indices) > 0:
+                            idx = batch_start + i
+                            # Fill neighbor positions (padded)
+                            n_neighbors = len(neighbor_indices)
+                            batch_positions[i, :n_neighbors] = vertices_torch[neighbor_indices]
+                            batch_centers[i] = vertices_torch[idx]
+                            batch_masks[i, :n_neighbors] = True
                     
-                    # Compute distances for confidence (still per-vertex, but only for valid ones)
-                    neighbor_positions = vertices_torch[neighbor_indices]
-                    current_pos = vertices_torch[idx]
-                    distances = torch.norm(neighbor_positions - current_pos, dim=1).cpu().numpy()
+                    # Vectorized distance computation for entire batch
+                    batch_centers_expanded = batch_centers.unsqueeze(1).expand(-1, max_batch_neighbors, -1)
+                    batch_distances = torch.norm(batch_positions - batch_centers_expanded, dim=2)  # (B, max_neighbors)
                     
-                    # Gaussian weights - confidence is sum of weights (not normalized by neighbor count)
-                    weights = np.exp(-distances**2 / (2 * sigma**2))
-                    confidences[idx] = np.sum(weights)
+                    # Apply Gaussian kernel vectorized
+                    if sigma <= 0:
+                        print(f"[WARN] Invalid sigma value: {sigma}, using default weights")
+                        batch_weights = batch_masks.float()  # Just count neighbors
+                    else:
+                        sigma_torch = torch.tensor(sigma, device=device)
+                        batch_weights = torch.exp(-batch_distances**2 / (2 * sigma_torch**2))  # (B, max_neighbors)
+                        batch_weights = batch_weights * batch_masks.float()
+                    batch_confidence_sums = torch.sum(batch_weights, dim=1).cpu().numpy()  # (B,)
+                    
+                    # Assign to final confidences array
+                    for i, is_valid in enumerate(batch_valid_mask):
+                        idx = batch_start + i
+                        if is_valid:
+                            confidences[idx] = batch_confidence_sums[i]
+                        else:
+                            confidences[idx] = 0.0
                 
                 time_confidence_computation += time.time() - start_confidence
             
@@ -891,7 +1147,10 @@ def estimate_normals_svd_simple(vertices: np.ndarray,
                     if return_confidences:
                         neighbor_positions = vertices_torch[neighbor_indices]
                         distances = torch.norm(neighbor_positions - vertices_torch[idx], dim=1).cpu().numpy()
-                        weights = np.exp(-distances**2 / (2 * sigma**2))
+                        if sigma <= 0:
+                            weights = np.ones_like(distances)  # Default weights
+                        else:
+                            weights = np.exp(-distances**2 / (2 * sigma**2))
                         confidences[idx] = np.sum(weights)
                         
                 except:
@@ -902,17 +1161,20 @@ def estimate_normals_svd_simple(vertices: np.ndarray,
     time_svd_loop = time.time() - start_svd_loop
     time_total = time.time() - start_total
     
-    # Print timing breakdown
+    # Print timing breakdown (protect against division by zero)
     print(f"\n⏱️  NORMAL ESTIMATION TIMING BREAKDOWN:")
-    print(f"  Adjacency list build:    {time_adjacency*1000:>8.2f}ms ({time_adjacency/time_total*100:>5.1f}%)")
-    print(f"  GPU tensor transfer:     {time_gpu_transfer*1000:>8.2f}ms ({time_gpu_transfer/time_total*100:>5.1f}%)")
-    print(f"  SVD computation:         {time_svd_computation*1000:>8.2f}ms ({time_svd_computation/time_total*100:>5.1f}%)")
-    if return_confidences:
-        print(f"  Confidence computation:  {time_confidence_computation*1000:>8.2f}ms ({time_confidence_computation/time_total*100:>5.1f}%)")
-    other_time = time_total - time_adjacency - time_gpu_transfer - time_svd_computation - time_confidence_computation
-    print(f"  Other operations:        {other_time*1000:>8.2f}ms ({other_time/time_total*100:>5.1f}%)")
-    print(f"  {'-'*50}")
-    print(f"  Total:                   {time_total*1000:>8.2f}ms (100.0%)")
+    if time_total > 0:
+        print(f"  Adjacency list build:    {time_adjacency*1000:>8.2f}ms ({time_adjacency/time_total*100:>5.1f}%)")
+        print(f"  GPU tensor transfer:     {time_gpu_transfer*1000:>8.2f}ms ({time_gpu_transfer/time_total*100:>5.1f}%)")
+        print(f"  SVD computation:         {time_svd_computation*1000:>8.2f}ms ({time_svd_computation/time_total*100:>5.1f}%)")
+        if return_confidences:
+            print(f"  Confidence computation:  {time_confidence_computation*1000:>8.2f}ms ({time_confidence_computation/time_total*100:>5.1f}%)")
+        other_time = time_total - time_adjacency - time_gpu_transfer - time_svd_computation - time_confidence_computation
+        print(f"  Other operations:        {other_time*1000:>8.2f}ms ({other_time/time_total*100:>5.1f}%)")
+        print(f"  {'-'*50}")
+        print(f"  Total:                   {time_total*1000:>8.2f}ms (100.0%)")
+    else:
+        print(f"  Total time too small to measure accurately: {time_total*1000:.4f}ms")
     
     if return_confidences:
         return normals, confidences
@@ -965,7 +1227,7 @@ def _geobrush_smoothing_vectorized(vertices: np.ndarray,
     """Vectorized implementation (good for 1-5 iterations)."""
     
     n_points = len(vertices)
-    smoothed_normals = normals.copy()
+    smoothed_normals = np.zeros_like(normals)
     
     # Pre-compute edge properties (vectorized)
     edge_i = edges[:, 0]
@@ -1073,7 +1335,7 @@ def _geobrush_smoothing_sparse(vertices: np.ndarray,
 
 def _torch_knn(vertices: np.ndarray, k: int, use_gpu: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """
-    PyTorch-based k-NN implementation for better compatibility.
+    Ultra-fast PyTorch k-NN implementation using full GPU vectorization.
     
     Args:
         vertices: Point positions (N, 3)
@@ -1090,62 +1352,99 @@ def _torch_knn(vertices: np.ndarray, k: int, use_gpu: bool = True) -> tuple[np.n
     
     n_points = len(vertices)
     
-    # For large datasets, process in batches to avoid memory issues
-    batch_size = min(1000, n_points)
+    # Single GPU operation - compute all pairwise distances at once
+    if n_points > 10000:
+        # Use chunked approach for large datasets
+        return _torch_knn_chunked(vertices_torch, k, device)
+    
+    # Full vectorized distance matrix computation (N x N)
+    distances = torch.cdist(vertices_torch, vertices_torch, p=2)  # (N, N)
+    
+    # Get k+1 nearest neighbors (including self) then exclude self
+    k_actual = min(k + 1, n_points)
+    knn_distances, knn_indices = torch.topk(distances, k_actual, largest=False, dim=1)
+    
+    # Remove self-neighbors (first column is distance 0 to self)
+    neighbor_indices = knn_indices[:, 1:k+1].cpu().numpy()  # (N, k)
+    neighbor_distances = knn_distances[:, 1:k+1].cpu().numpy()  # (N, k)
+    
+    return neighbor_indices, neighbor_distances
+
+
+def _torch_knn_chunked(vertices_torch: torch.Tensor, k: int, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    """Chunked k-NN for large datasets to avoid GPU memory issues."""
+    n_points = len(vertices_torch)
+    chunk_size = min(2000, n_points)  # Adjust based on GPU memory
     
     all_indices = []
     all_distances = []
     
-    for start_idx in range(0, n_points, batch_size):
-        end_idx = min(start_idx + batch_size, n_points)
-        batch_vertices = vertices_torch[start_idx:end_idx]
+    for start_idx in range(0, n_points, chunk_size):
+        end_idx = min(start_idx + chunk_size, n_points)
+        chunk_vertices = vertices_torch[start_idx:end_idx]
         
-        # Compute pairwise distances for this batch
-        # Shape: (batch_size, n_points)
-        distances = torch.cdist(batch_vertices, vertices_torch, p=2)
+        # Distance from chunk to all points
+        chunk_distances = torch.cdist(chunk_vertices, vertices_torch, p=2)
         
-        # Find k+1 nearest neighbors (including self)
+        # Get k+1 nearest (including self) then exclude self
         k_actual = min(k + 1, n_points)
-        batch_distances, batch_indices = torch.topk(distances, k_actual, dim=1, largest=False)
+        chunk_knn_dist, chunk_knn_idx = torch.topk(chunk_distances, k_actual, largest=False, dim=1)
         
-        # Remove self-connections (first column is always distance 0 to self)
-        if k_actual > 1:
-            batch_distances = batch_distances[:, 1:]  # Skip self
-            batch_indices = batch_indices[:, 1:]      # Skip self
+        # Remove self-neighbors
+        chunk_indices = chunk_knn_idx[:, 1:k+1].cpu().numpy()
+        chunk_dists = chunk_knn_dist[:, 1:k+1].cpu().numpy()
         
-        # Pad if we don't have enough neighbors
-        if batch_distances.shape[1] < k:
-            pad_size = k - batch_distances.shape[1]
-            batch_distances = torch.cat([batch_distances, torch.full((batch_distances.shape[0], pad_size), float('inf'), device=device)], dim=1)
-            batch_indices = torch.cat([batch_indices, torch.full((batch_indices.shape[0], pad_size), -1, dtype=torch.long, device=device)], dim=1)
-        
-        all_distances.append(batch_distances.cpu().numpy())
-        all_indices.append(batch_indices.cpu().numpy())
+        all_indices.append(chunk_indices)
+        all_distances.append(chunk_dists)
     
-    neighbor_indices = np.vstack(all_indices)
-    distances = np.vstack(all_distances)
-    
-    return neighbor_indices, distances
+    return np.vstack(all_indices), np.vstack(all_distances)
 
 
-def build_connectivity_vectorized(vertices: np.ndarray, k: int = 15, prune_factor: float = 2.0, use_gpu: bool = True) -> tuple[np.ndarray, float]:
+def build_knn_direct(vertices: np.ndarray, k: int = 15, use_gpu: bool = True) -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Ultra-optimized vectorized version of build_connectivity with minimal loops.
+    ULTRA-FAST: Direct k-NN computation returning raw indices and distances.
+    
+    This is the fastest approach - no adjacency list conversion, no loops, pure GPU vectorization.
+    Use this with estimate_normals_svd_knn() for maximum performance.
+    
+    Args:
+        vertices: Point positions (N, 3)
+        k: Number of nearest neighbors
+        use_gpu: If True, use GPU acceleration with PyTorch
+        
+    Returns:
+        tuple: (knn_indices, knn_distances, avg_radius)
+            - knn_indices: Neighbor indices (N, k)
+            - knn_distances: Neighbor distances (N, k)
+            - avg_radius: Average neighbor distance
+    """
+    # Single GPU k-NN call - maximum efficiency
+    knn_indices, knn_distances = _torch_knn(vertices, k, use_gpu)
+    
+    # Compute average radius for potential downstream use
+    avg_radius = np.mean(knn_distances[knn_distances > 0])
+    
+    return knn_indices, knn_distances, avg_radius
+
+
+def build_connectivity_vectorized(vertices: np.ndarray, k: int = 15, prune_factor: float = 2.0, use_gpu: bool = True) -> tuple[list[list[int]], float]:
+    """
+    Ultra-optimized vectorized k-NN connectivity with adjacency list output.
     
     Key optimizations:
     1. PyTorch GPU-accelerated k-NN for fast neighbor search
-    2. Vectorized edge creation from KNN results
-    3. Sparse matrix operations for distance aggregation
-    4. Vectorized pruning with boolean masks
+    2. Direct adjacency list construction (no edges intermediate)
+    3. Vectorized distance-based pruning
+    4. Eliminates adjacency reconstruction in downstream functions
     
     Args:
         vertices: Point positions (N, 3)
         k: Number of nearest neighbors to query
-        prune_factor: Multiplier for pruning (keep edges < avg_radius * prune_factor)
+        prune_factor: Multiplier for pruning (keep neighbors < avg_radius * prune_factor)
         use_gpu: If True, use GPU acceleration with PyTorch (default: True)
         
     Returns:
-        tuple: (edges, avg_radius)
+        tuple: (adjacency_lists, avg_radius) where adjacency_lists[i] = list of neighbor indices for vertex i
     """
     n_points = len(vertices)
     
@@ -1154,60 +1453,67 @@ def build_connectivity_vectorized(vertices: np.ndarray, k: int = 15, prune_facto
         # Get k-NN using PyTorch (GPU accelerated)
         indices, distances = _torch_knn(vertices, k, use_gpu)
         
-        # Ultra-vectorized edge creation using advanced indexing
-        # Create meshgrid of vertex indices and neighbor indices
-        vertex_ids = np.arange(n_points)[:, np.newaxis]  # (N, 1)
-        neighbor_ids = indices  # (N, k)
+        # Build adjacency lists directly from k-NN results
+        adjacency = [[] for _ in range(n_points)]
         
-        # Broadcast to create all (vertex, neighbor) pairs
-        src_vertices = np.broadcast_to(vertex_ids, (n_points, k)).flatten()
-        dst_vertices = neighbor_ids.flatten()
-        edge_distances = distances.flatten()
+        # Vectorized distance computation for all neighbors
+        all_distances = []
         
-        # Filter out invalid neighbors (from padding)
-        valid_mask = dst_vertices >= 0
-        src_vertices = src_vertices[valid_mask]
-        dst_vertices = dst_vertices[valid_mask]
-        edge_distances = edge_distances[valid_mask]
+        for i in range(n_points):
+            valid_neighbors = indices[i][indices[i] >= 0]  # Filter padding
+            neighbor_distances = distances[i][:len(valid_neighbors)]
+            
+            # Store neighbors and their distances
+            for j, neighbor_idx in enumerate(valid_neighbors):
+                if neighbor_idx != i:  # Skip self-neighbors
+                    adjacency[i].append(int(neighbor_idx))
+                    all_distances.append(neighbor_distances[j])
         
-        # Vectorized duplicate removal (keep only i < j)
-        unique_mask = src_vertices < dst_vertices
-        edges_initial = np.column_stack([src_vertices[unique_mask], dst_vertices[unique_mask]])
-        edge_dists = edge_distances[unique_mask]
-        
+        # Compute average radius from all neighbor distances
+        if len(all_distances) > 0:
+            avg_radius = np.mean(all_distances)
+        else:
+            print("[WARN] No valid neighbors found, using default radius 0.1")
+            avg_radius = 0.1
+            
     except Exception as e:
         print(f"[WARN] PyTorch KNN failed ({e}), falling back to CPU method")
+        # Fallback to edge-based method then convert to adjacency
         edges_initial, edge_dists = _fallback_knn_edges(vertices, k)
+        avg_radius = np.mean(edge_dists) if len(edge_dists) > 0 else 0.1
+        
+        # Convert edges to adjacency lists
+        adjacency = [[] for _ in range(n_points)]
+        for edge in edges_initial:
+            i, j = edge[0], edge[1]
+            adjacency[i].append(j)
+            adjacency[j].append(i)
     
-    # Ultra-fast radius computation using bincount (fastest aggregation)
-    edge_i, edge_j = edges_initial[:, 0], edges_initial[:, 1]
+    # Apply distance-based pruning
+    if prune_factor > 0:
+        prune_threshold = avg_radius * prune_factor
+        
+        # Convert to PyTorch for GPU-accelerated pruning
+        device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+        vertices_torch = torch.from_numpy(vertices).float().to(device)
+        
+        # Prune adjacency lists based on distances
+        for i in range(n_points):
+            if len(adjacency[i]) == 0:
+                continue
+                
+            neighbor_indices = adjacency[i]
+            current_pos = vertices_torch[i:i+1]  # (1, 3)
+            neighbor_pos = vertices_torch[neighbor_indices]  # (k, 3)
+            
+            # Compute distances on GPU
+            neighbor_distances = torch.norm(neighbor_pos - current_pos, dim=1).cpu().numpy()
+            
+            # Keep only neighbors within pruning threshold
+            keep_mask = neighbor_distances <= prune_threshold
+            adjacency[i] = [neighbor_indices[j] for j, keep in enumerate(keep_mask) if keep]
     
-    # Use bincount for ultra-fast per-vertex distance aggregation
-    # This is faster than sparse matrices for this specific use case
-    vertex_distance_sums = np.bincount(edge_i, weights=edge_dists, minlength=n_points) + \
-                          np.bincount(edge_j, weights=edge_dists, minlength=n_points)
-    vertex_neighbor_counts = np.bincount(edge_i, minlength=n_points) + \
-                            np.bincount(edge_j, minlength=n_points)
-    
-    # Vectorized average computation with zero-division protection
-    with np.errstate(invalid='ignore', divide='ignore'):
-        vertex_avg_distances = vertex_distance_sums / vertex_neighbor_counts
-        vertex_avg_distances = np.nan_to_num(vertex_avg_distances, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Compute global average radius (vectorized)
-    valid_distances = vertex_avg_distances[vertex_avg_distances > 0]
-    if len(valid_distances) == 0:
-        print("[WARN] No valid neighbors found, using default radius 0.1")
-        avg_radius = 0.1
-    else:
-        avg_radius = np.mean(valid_distances)
-    
-    # Vectorized pruning in single operation
-    prune_threshold = avg_radius * prune_factor
-    keep_mask = edge_dists <= prune_threshold
-    edges = edges_initial[keep_mask].astype('int32')
-    
-    return edges, avg_radius
+    return adjacency, avg_radius
 
 
 def _fallback_knn_edges(vertices: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1225,27 +1531,31 @@ def _fallback_knn_edges(vertices: np.ndarray, k: int) -> tuple[np.ndarray, np.nd
     return edges_initial, edge_dists
 
 
-def build_connectivity(vertices: np.ndarray, k: int = 15, prune_factor: float = 2.0, use_gpu: bool = True) -> tuple[np.ndarray, float]:
+def build_connectivity(vertices: np.ndarray, k: int = 15, prune_factor: float = 2.0, use_gpu: bool = True) -> tuple[list[list[int]], float]:
     """
-    Build k-NN connectivity using GPU-accelerated PyTorch k-NN with adaptive radius-based pruning.
+    Build k-NN connectivity returning adjacency lists directly.
     
-    This is a wrapper that calls the optimized vectorized implementation.
+    This is the main connectivity function optimized for downstream usage:
+    1. GPU-accelerated k-nearest neighbor search  
+    2. Direct adjacency list construction (no intermediate edges)
+    3. Adaptive pruning based on local density
+    4. Eliminates adjacency reconstruction in normal estimation
     
     For each point:
     1. Find k nearest neighbors using GPU-accelerated PyTorch k-NN
-    2. Calculate average distance to neighbors from edges
+    2. Calculate average distance to neighbors 
     3. Compute global average radius across all points
-    4. Prune edges where distance > avg_radius * prune_factor
+    4. Prune neighbors where distance > avg_radius * prune_factor
     
     Args:
         vertices: Point positions (N, 3)
         k: Number of nearest neighbors to query
-        prune_factor: Multiplier for pruning (keep edges < avg_radius * prune_factor)
+        prune_factor: Multiplier for pruning (keep neighbors < avg_radius * prune_factor)
         use_gpu: If True, use GPU acceleration with PyTorch (default: True)
         
     Returns:
-        tuple: (edges, avg_radius)
-            - edges: Edge array (M, 2) after pruning
+        tuple: (adjacency_lists, avg_radius)
+            - adjacency_lists: List of neighbor lists, adjacency_lists[i] = neighbors of vertex i
             - avg_radius: Computed average neighborhood radius
     """
     # Use the optimized vectorized implementation
@@ -1288,6 +1598,76 @@ def compute_exponential_map(vertices: np.ndarray,
     exp_map_time = time.time() - exp_map_start
     
     print(f"Exponential map computed in {exp_map_time:.2f}s")
+    
+    return exp_map
+
+
+def adjacency_to_edges(adjacency_lists: list[list[int]]) -> np.ndarray:
+    """
+    Convert adjacency lists to edge array for backward compatibility.
+    
+    Args:
+        adjacency_lists: List of neighbor lists, adjacency_lists[i] = neighbors of vertex i
+        
+    Returns:
+        edges: Edge array (M, 2) with undirected edges (i < j)
+    """
+    edges = []
+    for i, neighbors in enumerate(adjacency_lists):
+        for j in neighbors:
+            # Only add edge once (i < j) to avoid duplicates
+            if i < j:
+                edges.append([i, j])
+    
+    return np.array(edges, dtype=np.int32) if edges else np.empty((0, 2), dtype=np.int32)
+
+
+def compute_discrete_exponential_map(vertices: np.ndarray,
+                                   edges: np.ndarray,
+                                   normals: np.ndarray,
+                                   root_vertex: Optional[int] = None,
+                                   local_coordinates: bool = True) -> np.ndarray:
+    """
+    Compute discrete exponential map using the discrete_exp_map implementation.
+    
+    This function serves as a wrapper around the discrete_exp_map module, automatically
+    selecting the center point of the scene as the root vertex if not specified.
+    
+    Args:
+        vertices: Point positions (N, 3)
+        edges: Edge connectivity (M, 2)
+        normals: Normal vectors (N, 3)
+        root_vertex: Root vertex index. If None, uses scene center (default: None)
+        local_coordinates: Use local coordinate system (default: True)
+        
+    Returns:
+        exp_map: 2D exponential map coordinates (N, 2)
+    """
+    if dem is None:
+        raise ImportError("discrete_exp_map module not available. Cannot compute exponential map.")
+    
+    # Find root vertex as scene center if not specified
+    if root_vertex is None:
+        # Find vertex closest to scene centroid
+        centroid = np.mean(vertices, axis=0)
+        distances_to_centroid = np.linalg.norm(vertices - centroid, axis=1)
+        root_vertex = np.argmin(distances_to_centroid)
+        print(f"[INFO] Auto-selected root vertex {root_vertex} (closest to scene center)")
+    
+    print(f"[INFO] Computing discrete exponential map from root vertex {root_vertex}...")
+    exp_map_start = time.time()
+    
+    # Call the discrete exponential map function
+    exp_map = dem.discrete_exp_map(
+        V=vertices,
+        E=edges, 
+        N=normals,
+        root_idx=root_vertex,
+        add_locally=local_coordinates
+    )
+    
+    exp_map_time = time.time() - exp_map_start
+    print(f"[INFO] Discrete exponential map computed in {exp_map_time:.2f}s")
     
     return exp_map
 
@@ -1368,7 +1748,8 @@ def save_to_ply(vertices: np.ndarray,
                 normals: np.ndarray, 
                 edges: np.ndarray,
                 output_path: str,
-                confidences: Optional[np.ndarray] = None):
+                confidences: Optional[np.ndarray] = None,
+                exp_map: Optional[np.ndarray] = None):
     """
     Save processed scene data to PLY format with vertices, normals, and edges.
     
@@ -1378,38 +1759,35 @@ def save_to_ply(vertices: np.ndarray,
         edges: Edge connectivity (M, 2)
         output_path: Output PLY file path
         confidences: Optional confidence values (N,) for each vertex
+        exp_map: Optional exponential map coordinates (N, 2) for each vertex
     """
     
     n_vertices = len(vertices)
     n_edges = len(edges)
     
-    # PLY header with optional confidence property
+    # Build header dynamically based on optional data
+    properties = [
+        "property float x",
+        "property float y", 
+        "property float z",
+        "property float nx",
+        "property float ny",
+        "property float nz"
+    ]
+    
     if confidences is not None:
-        header = f"""ply
+        properties.append("property float confidence")
+    
+    if exp_map is not None:
+        properties.extend([
+            "property float exp_u",
+            "property float exp_v"
+        ])
+    
+    header = f"""ply
 format ascii 1.0
 element vertex {n_vertices}
-property float x
-property float y
-property float z
-property float nx
-property float ny
-property float nz
-property float confidence
-element edge {n_edges}
-property int vertex1
-property int vertex2
-end_header
-"""
-    else:
-        header = f"""ply
-format ascii 1.0
-element vertex {n_vertices}
-property float x
-property float y
-property float z
-property float nx
-property float ny
-property float nz
+{chr(10).join(properties)}
 element edge {n_edges}
 property int vertex1
 property int vertex2
@@ -1419,15 +1797,21 @@ end_header
     with open(output_path, 'w') as f:
         f.write(header)
         
-        # Write vertices with normals and optional confidence
+        # Write vertices with normals and optional data
         for i in range(n_vertices):
             v = vertices[i]
             n = normals[i]
+            line = f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}"
+            
             if confidences is not None:
                 conf = confidences[i]
-                f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {n[0]:.6f} {n[1]:.6f} {n[2]:.6f} {conf:.6f}\n")
-            else:
-                f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
+                line += f" {conf:.6f}"
+            
+            if exp_map is not None:
+                exp_u, exp_v = exp_map[i]
+                line += f" {exp_u:.6f} {exp_v:.6f}"
+            
+            f.write(line + "\n")
         
         # Write edges
         for edge in edges:
