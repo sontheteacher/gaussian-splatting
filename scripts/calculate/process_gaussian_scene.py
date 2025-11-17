@@ -29,19 +29,17 @@ import time
 from typing import Optional
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 try:
     from utils.research_utils import (
-        # build_connectivity,
         build_knn_direct,
-        # estimate_normals_svd_simple,
         estimate_normals_svd_knn,
         geobrush_smoothing,
-        compute_exponential_map,
         compute_discrete_exponential_map,
         adjacency_to_edges,
-        save_to_ply
+        save_to_ply,
+        sample_points_from_gaussians
     )
     from scene.gaussian_model import load_gaussian_model
 except Exception as e:
@@ -59,16 +57,20 @@ def process_gaussian_scene(ply_path: str,
                           y_up: bool = True,
                           compute_exp_map: bool = False,
                           root_vertex: Optional[int] = None,
-                          local_coords: bool = True) -> dict:
+                          local_coords: bool = True,
+                          n_samples_per_gaussian: int = 2,
+                          opacity_threshold: float = 0.1) -> dict:
     """
     Complete pipeline to process a Gaussian scene PLY file using k-NN connectivity.
     
     This function orchestrates the full processing pipeline:
     1. Load Gaussian scene from PLY
-    2. Build k-NN connectivity with adaptive radius pruning
-    3. Estimate normals using SVD on neighborhoods
-    4. Optional: Apply geobrush smoothing to normals
-    5. Save results to various formats
+    2. Optional: Sample additional points using reparametrization trick
+    3. Build k-NN connectivity with adaptive radius pruning
+    4. Estimate normals using SVD on neighborhoods
+    5. Optional: Apply geobrush smoothing to normals
+    6. Optional: Compute discrete exponential maps
+    7. Save results to various formats
     
     Args:
         ply_path: Path to input PLY file
@@ -80,6 +82,12 @@ def process_gaussian_scene(ply_path: str,
         smooth_sparse: Use sparse matrix smoothing (faster for iterations >= 5)
         output_dir: Directory to save results (optional)
         y_up: If True, orient normals to point in +Y direction (default: True)
+        compute_exp_map: If True, compute discrete exponential map (default: False)
+        root_vertex: Root vertex for exponential map (default: None = centroid)
+        local_coords: Use local coordinate system for exp map (default: True)
+        n_samples_per_gaussian: Number of points to sample per Gaussian (default: 2)
+                               Set to 0 or 1 to disable sampling
+        opacity_threshold: Minimum opacity to include Gaussian in sampling (default: 0.1)
         
     Returns:
         Dictionary with processed data:
@@ -97,21 +105,59 @@ def process_gaussian_scene(ply_path: str,
     
     # Step 1: Load Gaussian scene
     step_start = time.time()
-    vertices, gaussian_model = load_gaussian_model(ply_path)
+    original_vertices, gaussian_model = load_gaussian_model(ply_path)
     timings['load'] = time.time() - step_start
     
-    # Step 2: ULTRA-FAST k-NN computation (direct indices, no adjacency conversion!)
+    print(f"[INFO] Loaded {len(original_vertices)} Gaussian centers")
+    
+    # Step 2: Sample additional points using reparametrization trick
+    if n_samples_per_gaussian > 1:
+        step_start = time.time()
+        
+        # Get Gaussian parameters
+        scales = gaussian_model.get_scaling.detach().cpu().numpy()
+        rotations = gaussian_model.get_rotation.detach().cpu().numpy()
+        opacities = gaussian_model.get_opacity.detach().cpu().numpy()
+        
+        # Sample points using GPU-optimized reparametrization (keeps data on GPU!)
+        vertices = sample_points_from_gaussians(
+            original_vertices,
+            scales,
+            rotations,
+            opacities,
+            n_samples_per_gaussian=n_samples_per_gaussian,
+            opacity_threshold=opacity_threshold,
+            use_gpu=False,
+            return_torch=False  # Keep on GPU for k-NN!
+        )
+        
+        timings['sampling'] = time.time() - step_start
+        print(f"[INFO] Point cloud size: {len(original_vertices)} -> {len(vertices)} ({len(vertices)/len(original_vertices):.1f}x)")
+        print(f"[INFO] ⚡ Sampled points kept on GPU to avoid CPU transfer overhead")
+    else:
+        vertices = original_vertices
+        gaussian_indices = np.arange(len(vertices))
+        timings['sampling'] = 0.0
+        print(f"[INFO] Reparametrization sampling disabled (n_samples={n_samples_per_gaussian})")
+    
+    # Step 3: ULTRA-FAST k-NN computation (direct indices, no adjacency conversion!)
     step_start = time.time()
     knn_indices, knn_distances, avg_radius = build_knn_direct(vertices, k=k, use_gpu=True)
     timings['connectivity'] = time.time() - step_start
     
-    # Step 3: ULTRA-FAST normal estimation (direct from k-NN indices!)
+    # Step 4: ULTRA-FAST normal estimation (direct from k-NN indices!)
     step_start = time.time()
     normals, confidences = estimate_normals_svd_knn(
         vertices, knn_indices, knn_distances, k_neighbors=k, y_up=y_up, 
         use_gpu=True, return_confidences=True, sigma=avg_radius, prune_factor=prune_factor
     )
     timings['normal_estimation'] = time.time() - step_start
+    
+    # Convert vertices back to NumPy if it's a tensor (after all GPU operations are done)
+    import torch
+    if isinstance(vertices, torch.Tensor):
+        vertices = vertices.cpu().numpy()
+        print(f"[INFO] ⚡ Converted vertices back to NumPy after GPU pipeline completed")
     
     # Helper function to convert k-NN indices to adjacency lists when needed
     def knn_to_adjacency(knn_indices):
@@ -124,7 +170,7 @@ def process_gaussian_scene(ply_path: str,
                     adjacency[i].append(int(neighbor_idx))
         return adjacency
     
-    # Step 4: Optional smoothing (convert k-NN to edges for smoothing function)
+    # Step 5: Optional smoothing (convert k-NN to edges for smoothing function)
     if smooth_iterations > 0:
         step_start = time.time()
         adjacency_lists = knn_to_adjacency(knn_indices)
@@ -138,13 +184,16 @@ def process_gaussian_scene(ply_path: str,
         timings['smoothing'] = 0.0
         edges = None
     
-    # Step 5: Compute statistics (create edges for stats if not already created)
+    # Step 6: Compute statistics (create edges for stats if not already created)
     if edges is None:
         adjacency_lists = knn_to_adjacency(knn_indices)
         edges = adjacency_to_edges(adjacency_lists)
     
     stats = {
         'n_vertices': len(vertices),
+        'n_original_gaussians': len(original_vertices),
+        'n_sampled_points': len(vertices) - len(original_vertices) if n_samples_per_gaussian > 1 else 0,
+        'sampling_ratio': len(vertices) / len(original_vertices) if n_samples_per_gaussian > 1 else 1.0,
         'n_edges': len(edges),
         'avg_connections': 2 * len(edges) / len(vertices),
         'avg_radius': avg_radius,
@@ -152,7 +201,7 @@ def process_gaussian_scene(ply_path: str,
         'bbox_max': vertices.max(axis=0).tolist(),
     }
     
-    # Step 6: Optionally compute discrete exponential map
+    # Step 7: Optionally compute discrete exponential map
     discrete_exp_map = None
     if compute_exp_map:
         step_start = time.time()
@@ -173,6 +222,8 @@ def process_gaussian_scene(ply_path: str,
     
     result = {
         'vertices': vertices,
+        'original_vertices': original_vertices,
+        'gaussian_indices': gaussian_indices,  # Maps sampled points back to source Gaussians
         'gaussian_model': gaussian_model,
         'normals': normals,
         'confidences': confidences,
@@ -211,6 +262,7 @@ def process_gaussian_scene(ply_path: str,
     # Print timing summary only
     print(f"\n⏱️  TIMING SUMMARY:")
     print(f"  Load Gaussian model:     {timings['load']:>8.3f}s")
+    print(f"  Sample points (reparam): {timings['sampling']:>8.3f}s")
     print(f"  Build k-NN connectivity: {timings['connectivity']:>8.3f}s")
     print(f"  Estimate normals (SVD):  {timings['normal_estimation']:>8.3f}s")
     print(f"  Smoothing:               {timings['smoothing']:>8.3f}s")
@@ -283,6 +335,20 @@ def parse_args() -> argparse.Namespace:
         help='Use local coordinate system for exponential map (default: True)'
     )
     parser.add_argument(
+        '--n-samples',
+        type=int,
+        default=1,
+        dest='n_samples_per_gaussian',
+        help='Number of points to sample per Gaussian using reparametrization trick (default: 1 = disabled). '
+             'Set to 2 or higher to enable sampling and densify the point cloud.'
+    )
+    parser.add_argument(
+        '--opacity-threshold',
+        type=float,
+        default=0.1,
+        help='Minimum opacity for Gaussians to be included in sampling (default: 0.1)'
+    )
+    parser.add_argument(
         '--y-up',
         action='store_true',
         default=True,
@@ -307,6 +373,8 @@ def main() -> int:
     try:
         # Process scene using local process_gaussian_scene function
         print(f"Processing {args.input_ply} with k={args.k}, prune_factor={args.prune_factor}")
+        if args.n_samples_per_gaussian > 1:
+            print(f"Reparametrization sampling enabled: {args.n_samples_per_gaussian} samples per Gaussian")
         if args.smooth_iterations > 0:
             print(f"Smoothing enabled: {args.smooth_iterations} iteration(s)")
         if args.compute_exp_map:
@@ -322,13 +390,20 @@ def main() -> int:
             y_up=args.y_up,
             compute_exp_map=args.compute_exp_map,
             root_vertex=args.root_vertex,
-            local_coords=args.local_coords
+            local_coords=args.local_coords,
+            n_samples_per_gaussian=args.n_samples_per_gaussian,
+            opacity_threshold=args.opacity_threshold
         )
         
         print("\n" + "="*60)
         print("PROCESSING COMPLETE")
         print("="*60)
-        print(f"Vertices: {result['stats']['n_vertices']}")
+        print(f"Original Gaussians: {result['stats']['n_original_gaussians']}")
+        if result['stats']['n_sampled_points'] > 0:
+            print(f"Sampled points: {result['stats']['n_sampled_points']}")
+            print(f"Total vertices: {result['stats']['n_vertices']} ({result['stats']['sampling_ratio']:.1f}x)")
+        else:
+            print(f"Total vertices: {result['stats']['n_vertices']} (no sampling)")
         print(f"Edges: {result['stats']['n_edges']}")
         print(f"Average connections per vertex: {result['stats']['avg_connections']:.1f}")
         print(f"Average radius: {result['avg_radius']:.6f}")
